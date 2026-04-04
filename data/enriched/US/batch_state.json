@@ -1,0 +1,9 @@
+{
+  "batch_id": "msgbatch_01TyfVAMzzVij62SpQPD8FVr",
+  "run_date": "2026-04-04",
+  "country": "US",
+  "total_requests": 1993,
+  "submitted_at": "2026-04-04T09:36:29.089311+00:00",
+  "listings_file": "data/enriched/US/batch_listings_2026-04-04.json",
+  "label": ""
+}

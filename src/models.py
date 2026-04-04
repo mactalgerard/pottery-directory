@@ -123,7 +123,7 @@ class EnrichedListing(CleanListing):
     # --- Retail / extras ---
     sells_supplies: Optional[bool] = Field(
         default=None,
-        description="True if the studio sells pottery supplies on-site.",
+        description="True if the studio sells pottery supplies (clay, glazes, tools) on-site.",
     )
     kids_classes: Optional[bool] = Field(
         default=None,
@@ -132,6 +132,31 @@ class EnrichedListing(CleanListing):
     private_events: Optional[bool] = Field(
         default=None,
         description="True if the studio hosts private events (birthdays, corporate, etc.).",
+    )
+
+    # --- US-validated additional fields ---
+    open_studio_access: Optional[bool] = Field(
+        default=None,
+        description="True if the studio offers open studio / membership access for independent work.",
+    )
+    firing_services: Optional[bool] = Field(
+        default=None,
+        description="True if the studio offers kiln firing services for outside work (home potters).",
+    )
+    byob_events: Optional[bool] = Field(
+        default=None,
+        description="True if the studio hosts BYOB 'Sip & Spin' or similar social pottery events.",
+    )
+    date_night: Optional[bool] = Field(
+        default=None,
+        description="True if the studio explicitly offers couples / date night pottery sessions.",
+    )
+    membership_model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Describes the studio's membership/access model, "
+            "e.g. 'monthly unlimited', 'class-based', 'firing-only', 'hourly passes'."
+        ),
     )
 
     # --- Generated description ---

@@ -260,19 +260,21 @@ async def run_collect(country: CountryCode, dry_run: bool = False, enrichment: l
     return await outscraper_client.collect_listings(country, dry_run=dry_run, enrichment=enrichment, max_queries=max_queries)
 
 
-async def run_research(country: CountryCode) -> dict:
+async def run_research(country: CountryCode, force: bool = False) -> dict:
     """
     Run the EnrichmentResearcherAgent for the given country.
 
-    Skipped if context/enrichment_fields_{COUNTRY}.md already exists.
+    Skipped if context/enrichment_fields_{COUNTRY}.md already exists,
+    unless force=True.
 
     Args:
         country: Country code.
+        force:   Re-run even if the context file already exists.
 
     Returns:
-        Dict of confirmed enrichment field definitions.
+        Dict with keys "path" and "status".
     """
-    return await enrichment_researcher.run(country)
+    return await enrichment_researcher.run(country, force=force)
 
 
 async def run_clean(
@@ -327,25 +329,62 @@ async def run_review(
     return await flagged_review_agent.run(flagged_listings, country, path)
 
 
-async def run_enrich(country: CountryCode) -> list:
+async def run_enrich(
+    country: CountryCode,
+    input_path: Path | None = None,
+    sample: int | None = None,
+    label: str = "",
+) -> str:
     """
-    Run the EnrichmentAgent for the given country.
+    Crawl listing websites and submit an Anthropic Batch API enrichment job.
 
-    Loads the latest cleaned CSV from data/cleaned/{COUNTRY}/,
-    runs enrichment, and writes output CSV.
+    Loads the latest cleaned CSV (or --input), optionally samples N random
+    listings, crawls their websites, and submits a batch job. Exits after
+    submission — use run_retrieve() to get results when the batch is done.
+
+    Args:
+        country:    Country code.
+        input_path: Explicit path to cleaned CSV, or None to use latest.
+        sample:     If set, randomly select this many listings before submitting.
+
+    Returns:
+        The Anthropic batch ID.
+    """
+    import random
+    path = input_path or find_latest_cleaned_csv(country)
+    console.print(f"[dim]Loading cleaned CSV: {path}[/dim]")
+    listings = load_clean_csv(path, country)
+
+    if sample:
+        listings = random.sample(listings, min(sample, len(listings)))
+        console.print(f"[dim]Sampled {len(listings)} listings at random[/dim]")
+
+    return await enrichment_agent.submit(listings, country, label=label)
+
+
+def run_retrieve(country: CountryCode, label: str = "") -> tuple[bool, int, int]:
+    """
+    Check the Anthropic batch status and write enriched CSV if complete.
 
     Args:
         country: Country code.
+        label:   Run label — must match the label used during submit.
 
     Returns:
-        List of EnrichedListing objects.
+        Tuple of (is_complete, done_count, total_count).
     """
-    cleaned_path = find_latest_cleaned_csv(country)
-    console.print(f"[dim]Loading cleaned CSV: {cleaned_path}[/dim]")
+    return enrichment_agent.retrieve(country, label=label)
 
-    # TODO: pd.read_csv(cleaned_path) → list[CleanListing]
-    # TODO: enrichment_agent.run(cleaned_listings, country)
-    raise NotImplementedError
+
+async def run_poll(country: CountryCode, label: str = "") -> None:
+    """
+    Poll the batch status every 5 minutes until complete, then write CSV.
+
+    Args:
+        country: Country code.
+        label:   Run label — must match the label used during submit.
+    """
+    await enrichment_agent.poll(country, label=label)
 
 
 # ---------------------------------------------------------------------------
@@ -451,6 +490,12 @@ def parse_args() -> argparse.Namespace:
         help="Collect phase only: print queries without hitting the OutScraper API.",
     )
     parser.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Research phase only: re-run even if the context file already exists.",
+    )
+    parser.add_argument(
         "--enrichment",
         nargs="+",
         default=None,
@@ -463,6 +508,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Limit collect phase to first N queries. Useful for sampling.",
+    )
+    parser.add_argument(
+        "--sample",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Enrich phase: randomly select N listings before submitting batch.",
+    )
+    parser.add_argument(
+        "--retrieve",
+        action="store_true",
+        default=False,
+        help="Enrich phase: check batch status and write CSV if complete.",
+    )
+    parser.add_argument(
+        "--poll",
+        action="store_true",
+        default=False,
+        help="Enrich phase: poll every 5 minutes until batch is complete, then write CSV.",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        default="",
+        metavar="NAME",
+        help="Enrich phase: label for this run, appended to output filenames (e.g. 'sample10').",
     )
     return parser.parse_args()
 
@@ -499,7 +570,9 @@ async def main() -> None:
 
     # Phase: research only
     if args.phase == "research":
-        await run_research(country)
+        result = await run_research(country, force=args.force)
+        if result["status"] == "written":
+            console.print(f"[green]Research complete → {result['path']}[/green]")
         return
 
     # Phase: clean only
@@ -527,21 +600,23 @@ async def main() -> None:
 
     # Phase: enrich only
     if args.phase == "enrich":
-        enriched = await run_enrich(country)
-        if args.to_supabase:
-            result = await supabase_client.upsert_listings(enriched)
-        else:
-            result = None
-        print_summary(
-            country=country,
-            total_raw=0,
-            deduplicated=0,
-            rejected=0,
-            flagged=0,
-            cleaned=len(enriched),
-            enriched=len(enriched),
-            supabase_result=result,
-        )
+        # --retrieve (with optional --poll): check / wait for existing batch
+        if args.retrieve:
+            if args.poll:
+                await run_poll(country, label=args.label)
+            else:
+                is_complete, done, total = run_retrieve(country, label=args.label)
+                if not is_complete:
+                    console.print(
+                        f"[dim]Run with --poll to wait automatically, "
+                        f"or re-run --retrieve later.[/dim]"
+                    )
+            return
+
+        # Default: crawl + submit new batch
+        # Auto-generate label from --sample if --label not explicitly set
+        label = args.label or (f"sample{args.sample}" if args.sample else "")
+        await run_enrich(country, args.input, args.sample, label=label)
         return
 
     # Full pipeline (all phases)

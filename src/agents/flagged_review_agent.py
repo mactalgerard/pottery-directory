@@ -42,7 +42,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 CLEANED_DIR = Path("data/cleaned")
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-sonnet-4-6"
 CONCURRENCY = 1          # Web search responses are large; 1 concurrent avoids rate limits
 RETRY_DELAYS = [60, 120] # Seconds to wait before retry 1 and retry 2 on 429
 

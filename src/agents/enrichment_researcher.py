@@ -13,16 +13,18 @@ Research is always country-scoped:
        Note: AU studios more commonly use "hand building" and "clay classes"
        than "pottery wheel" — adjust search terms accordingly.
 
-The agent is skipped if `context/enrichment_fields_{COUNTRY}.md` already exists.
+The agent is skipped if `context/enrichment_fields_{COUNTRY}.md` already exists,
+unless force=True is passed.
 
 Tools available (via Claude tool_use):
   web_search         — Anthropic native web_search_20250305 tool
-  get_niche_context  — returns the country + niche string (no-op stub)
+  get_niche_context  — returns the country + niche string
 """
 
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -38,9 +40,8 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 CONTEXT_DIR = Path("context")
-MODEL = "claude-sonnet-4-20250514"
+MODEL = "claude-opus-4-6"
 
-# Tool schemas sent to Claude
 TOOLS: list[dict] = [
     {
         "type": "web_search_20250305",
@@ -67,26 +68,30 @@ TOOLS: list[dict] = [
 ]
 
 
-def _load_system_prompt() -> str:
+def _load_system_prompt(country: CountryCode) -> str:
     """
-    Load the enrichment researcher system prompt from prompts/enrichment_researcher_system.md.
+    Load and render the enrichment researcher system prompt.
+
+    Replaces {COUNTRY} and {DATE} placeholders in the markdown file.
 
     Returns:
-        The system prompt as a string.
+        Rendered system prompt string.
 
     Raises:
         FileNotFoundError: if the prompt file does not exist.
     """
     prompt_path = Path("src/prompts/enrichment_researcher_system.md")
-    return prompt_path.read_text()
+    raw = prompt_path.read_text()
+    today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    return raw.replace("{COUNTRY}", country).replace("{DATE}", today)
 
 
 def _handle_tool_call(tool_name: str, tool_input: dict, country: CountryCode) -> Any:
     """
-    Dispatch a tool_use call from Claude to the appropriate Python function.
+    Dispatch a custom tool_use call from Claude.
 
     Only `get_niche_context` is handled here — `web_search` is a native
-    Anthropic tool handled server-side.
+    Anthropic tool executed server-side.
 
     Args:
         tool_name:  Name of the tool Claude is calling.
@@ -95,10 +100,19 @@ def _handle_tool_call(tool_name: str, tool_input: dict, country: CountryCode) ->
 
     Returns:
         Tool result as a JSON-serialisable dict.
+
+    Raises:
+        ValueError: if an unknown custom tool name is received.
     """
     if tool_name == "get_niche_context":
-        # TODO: Return {"country": country, "niche": "pottery and ceramics studios"}
-        raise NotImplementedError
+        return {
+            "country": country,
+            "niche": "pottery and ceramics studios",
+            "description": (
+                "A directory of studios that offer pottery classes, "
+                "open studio access, or ceramics memberships to the public."
+            ),
+        }
     raise ValueError(f"Unknown tool: {tool_name}")
 
 
@@ -119,37 +133,36 @@ def _write_context_file(country: CountryCode, content: str) -> Path:
     return output_path
 
 
-async def run(country: CountryCode) -> dict:
+async def run(country: CountryCode, force: bool = False) -> dict:
     """
     Run the EnrichmentResearcherAgent for a given country.
 
     Checks whether context/enrichment_fields_{COUNTRY}.md already exists.
-    If it does, skips research and returns the existing field list.
-    If not, runs the full Claude agentic loop with web_search tool_use.
+    If it does and force=False, skips research and returns early.
+    If force=True or the file is missing, runs the full Claude agentic loop.
 
     Args:
         country: Country code — "US", "CA", or "AU".
+        force:   If True, re-run research even if the context file exists.
 
     Returns:
-        Dict mapping field names to their definitions as confirmed by research.
-        Example:
-            {
-                "class_types": "Types of classes offered (wheel, hand building, etc.)",
-                "kids_classes": "Whether kids/family classes are offered",
-                ...
-            }
+        Dict with keys "path" (output file path) and "status" ("written" or "skipped").
 
     Raises:
         EnvironmentError: if ANTHROPIC_API_KEY is not set.
         FileNotFoundError: if the system prompt file is missing.
     """
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise EnvironmentError("ANTHROPIC_API_KEY is not set.")
+
     output_path = CONTEXT_DIR / f"enrichment_fields_{country}.md"
-    if output_path.exists():
+
+    if output_path.exists() and not force:
         console.print(
-            f"[yellow]Skipping research — {output_path} already exists.[/yellow]"
+            f"[yellow]Skipping research — {output_path} already exists. "
+            f"Use --force to re-run.[/yellow]"
         )
-        # TODO: Parse existing file and return field dict
-        raise NotImplementedError
+        return {"path": str(output_path), "status": "skipped"}
 
     console.print(
         Panel(
@@ -158,15 +171,68 @@ async def run(country: CountryCode) -> dict:
         )
     )
 
-    # TODO: Initialise anthropic.Anthropic() client
-    # TODO: Load system prompt
-    # TODO: Build initial user message asking agent to research for `country`
-    # TODO: Run agentic tool_use loop:
-    #         while response has tool_use blocks:
-    #           dispatch _handle_tool_call for each block
-    #           append tool results to messages
-    #           call client.messages.create again
-    # TODO: Extract final text from response
-    # TODO: Call _write_context_file(country, final_text)
-    # TODO: Parse final_text into field dict and return it
-    raise NotImplementedError
+    client = anthropic.Anthropic()
+    system_prompt = _load_system_prompt(country)
+
+    initial_message = (
+        f"Research the pottery and ceramics studio market in {country}. "
+        f"Start by calling get_niche_context to confirm your scope, then search "
+        f"Reddit, Google Maps review patterns, and local pottery communities to "
+        f"validate the enrichment fields. Write your full findings in the output "
+        f"format specified in your instructions."
+    )
+
+    messages: list[dict] = [{"role": "user", "content": initial_message}]
+
+    # Agentic loop — runs until Claude produces a final text response
+    while True:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=system_prompt,
+            tools=TOOLS,
+            messages=messages,
+        )
+
+        logger.debug("stop_reason=%s content_blocks=%d", response.stop_reason, len(response.content))
+
+        # Append Claude's turn to the conversation
+        messages.append({"role": "assistant", "content": response.content})
+
+        # Collect any custom tool calls that need client-side dispatch
+        custom_tool_uses = [
+            b for b in response.content
+            if b.type == "tool_use" and b.name != "web_search"
+        ]
+
+        if custom_tool_uses:
+            tool_results = []
+            for tool_use in custom_tool_uses:
+                console.print(f"  [dim]→ tool: {tool_use.name}({tool_use.input})[/dim]")
+                try:
+                    result = _handle_tool_call(tool_use.name, tool_use.input, country)
+                except ValueError as exc:
+                    result = {"error": str(exc)}
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_use.id,
+                    "content": json.dumps(result),
+                })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        # If stop reason is end_turn, extract the final text block
+        if response.stop_reason == "end_turn":
+            text_blocks = [b for b in response.content if b.type == "text"]
+            if not text_blocks:
+                raise RuntimeError("Agent finished but produced no text output.")
+            final_text = "\n\n".join(b.text for b in text_blocks)
+            break
+
+        # Web search and other server-side tools: loop continues automatically
+        # (the API has already executed them and appended results to content)
+
+    output_path = _write_context_file(country, final_text)
+    console.print(f"[green]→ Enrichment fields written to {output_path}[/green]")
+
+    return {"path": str(output_path), "status": "written"}
