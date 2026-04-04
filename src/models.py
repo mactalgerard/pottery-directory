@@ -26,6 +26,7 @@ class RawListing(BaseModel):
 
     name: str
     phone: Optional[str] = None
+    email: Optional[str] = None
     website: Optional[str] = None
     full_address: Optional[str] = None
     city: Optional[str] = None

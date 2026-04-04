@@ -31,8 +31,8 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.agents import cleaner_agent, enrichment_agent, enrichment_researcher
-from src.models import CountryCode, RawListing
+from src.agents import cleaner_agent, enrichment_agent, enrichment_researcher, flagged_review_agent
+from src.models import CleanListing, CountryCode, RawListing
 from src.tools import outscraper_client, supabase_client
 
 load_dotenv()
@@ -40,7 +40,7 @@ console = Console()
 logger = logging.getLogger(__name__)
 
 VALID_COUNTRIES: list[CountryCode] = ["US", "CA", "AU"]
-VALID_PHASES = ["collect", "research", "clean", "enrich"]
+VALID_PHASES = ["collect", "research", "clean", "review", "enrich"]
 
 RAW_DIR = Path("data/raw")
 CLEANED_DIR = Path("data/cleaned")
@@ -74,11 +74,42 @@ def load_raw_csv(path: Path, country: CountryCode) -> list[RawListing]:
     if not path.exists():
         raise FileNotFoundError(f"Raw CSV not found: {path}")
 
-    # TODO: pd.read_csv(path)
-    # TODO: For each row, build RawListing(**row_dict, country=country)
-    # TODO: Collect Pydantic validation errors; log and skip malformed rows
-    # TODO: Return list of valid RawListing objects
-    raise NotImplementedError
+    import math
+
+    df = pd.read_csv(path)
+    records = df.to_dict(orient="records")
+
+    listings: list[RawListing] = []
+    for record in records:
+        # pandas represents missing values as float NaN — convert all to None first
+        for key, value in record.items():
+            if isinstance(value, float) and math.isnan(value):
+                record[key] = None
+
+        # Coerce numeric fields
+        for field in ("latitude", "longitude"):
+            if record.get(field) is not None:
+                try:
+                    record[field] = float(record[field])
+                except (ValueError, TypeError):
+                    record[field] = None
+        if record.get("reviews_count") is not None:
+            try:
+                record["reviews_count"] = int(float(record["reviews_count"]))
+            except (ValueError, TypeError):
+                record["reviews_count"] = None
+        # postal_code must be a string — pandas reads numeric zip codes as int
+        if record.get("postal_code") is not None:
+            record["postal_code"] = str(record["postal_code"])
+
+        # Always inject country from the CLI flag — never trust the CSV value
+        record["country"] = country
+        try:
+            listings.append(RawListing(**record))
+        except Exception as exc:
+            logger.warning("Skipping malformed row %r: %s", record.get("name"), exc)
+
+    return listings
 
 
 def find_latest_raw_csv(country: CountryCode) -> Path:
@@ -131,12 +162,88 @@ def find_latest_cleaned_csv(country: CountryCode) -> Path:
     return csvs[0]
 
 
+def find_latest_flagged_csv(country: CountryCode) -> Path:
+    """
+    Find the most recently modified flagged CSV in data/cleaned/{COUNTRY}/.
+
+    Only looks for files matching flagged_{date}.csv pattern.
+
+    Args:
+        country: Country code — determines which subdirectory to search.
+
+    Returns:
+        Path to the most recently modified flagged CSV.
+
+    Raises:
+        FileNotFoundError: if no flagged CSVs exist (run clean phase first).
+    """
+    cleaned_dir = CLEANED_DIR / country
+    csvs = sorted(
+        cleaned_dir.glob("flagged_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not csvs:
+        raise FileNotFoundError(
+            f"No flagged CSV files found in {cleaned_dir}. "
+            f"Run `python pipeline.py --country {country} --phase clean` first."
+        )
+    return csvs[0]
+
+
+def load_clean_csv(path: Path, country: CountryCode) -> list[CleanListing]:
+    """
+    Load a cleaned or flagged CSV into a list of CleanListing objects.
+
+    Handles NaN → None coercion and type casting for numeric and datetime fields.
+
+    Args:
+        path:    Path to the cleaned or flagged CSV.
+        country: Country code — used to override the country column defensively.
+
+    Returns:
+        List of CleanListing objects.
+    """
+    import math
+
+    df = pd.read_csv(path)
+    records = df.to_dict(orient="records")
+
+    listings: list[CleanListing] = []
+    for record in records:
+        for key, value in record.items():
+            if isinstance(value, float) and math.isnan(value):
+                record[key] = None
+
+        for field in ("latitude", "longitude"):
+            if record.get(field) is not None:
+                try:
+                    record[field] = float(record[field])
+                except (ValueError, TypeError):
+                    record[field] = None
+        if record.get("reviews_count") is not None:
+            try:
+                record["reviews_count"] = int(float(record["reviews_count"]))
+            except (ValueError, TypeError):
+                record["reviews_count"] = None
+        if record.get("postal_code") is not None:
+            record["postal_code"] = str(record["postal_code"])
+        if record.get("is_verified_niche") is not None:
+            record["is_verified_niche"] = bool(record["is_verified_niche"])
+
+        record["country"] = country
+        try:
+            listings.append(CleanListing(**record))
+        except Exception as exc:
+            logger.warning("Skipping malformed row %r: %s", record.get("name"), exc)
+
+    return listings
+
+
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
 
 
-async def run_collect(country: CountryCode, dry_run: bool = False) -> Path:
+async def run_collect(country: CountryCode, dry_run: bool = False, enrichment: list | None = None, max_queries: int | None = None) -> Path:
     """
     Run the OutScraper collect phase for the given country.
 
@@ -150,7 +257,7 @@ async def run_collect(country: CountryCode, dry_run: bool = False) -> Path:
     Returns:
         Path to the written raw CSV file.
     """
-    return await outscraper_client.collect_listings(country, dry_run=dry_run)
+    return await outscraper_client.collect_listings(country, dry_run=dry_run, enrichment=enrichment, max_queries=max_queries)
 
 
 async def run_research(country: CountryCode) -> dict:
@@ -189,6 +296,35 @@ async def run_clean(
     console.print(f"[dim]Loading raw CSV: {path}[/dim]")
     raw_listings = load_raw_csv(path, country)
     return await cleaner_agent.run(raw_listings, country, str(path.name))
+
+
+async def run_review(
+    country: CountryCode,
+    input_path: Path | None,
+) -> tuple[int, int, int]:
+    """
+    Run the FlaggedReviewAgent for the given country.
+
+    Loads the flagged CSV (from --input or the latest flagged_*.csv),
+    reviews each listing via Claude web search, and redistributes rows
+    into the cleaned / rejected / flagged CSVs in place.
+
+    Args:
+        country:    Country code.
+        input_path: Explicit path to a flagged CSV, or None to use latest.
+
+    Returns:
+        Tuple of (verified_count, rejected_count, unclear_count).
+    """
+    path = input_path or find_latest_flagged_csv(country)
+    console.print(f"[dim]Loading flagged CSV: {path}[/dim]")
+    flagged_listings = load_clean_csv(path, country)
+
+    if not flagged_listings:
+        console.print(f"[yellow]No flagged listings to review in {path}[/yellow]")
+        return 0, 0, 0
+
+    return await flagged_review_agent.run(flagged_listings, country, path)
 
 
 async def run_enrich(country: CountryCode) -> list:
@@ -314,6 +450,20 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Collect phase only: print queries without hitting the OutScraper API.",
     )
+    parser.add_argument(
+        "--enrichment",
+        nargs="+",
+        default=None,
+        metavar="SERVICE",
+        help="OutScraper enrichment services to apply during collect (e.g. domains_service).",
+    )
+    parser.add_argument(
+        "--max-queries",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Limit collect phase to first N queries. Useful for sampling.",
+    )
     return parser.parse_args()
 
 
@@ -342,7 +492,7 @@ async def main() -> None:
 
     # Phase: collect only
     if args.phase == "collect":
-        raw_path = await run_collect(country, dry_run=args.dry_run)
+        raw_path = await run_collect(country, dry_run=args.dry_run, enrichment=args.enrichment, max_queries=args.max_queries)
         if not args.dry_run:
             console.print(f"[green]Collect complete → {raw_path}[/green]")
         return
@@ -363,6 +513,15 @@ async def main() -> None:
             flagged=len(flagged),
             cleaned=len(cleaned),
             enriched=0,
+        )
+        return
+
+    # Phase: review only (optional — resolves flagged listings via web search)
+    if args.phase == "review":
+        verified, rejected, unclear = await run_review(country, args.input)
+        console.print(
+            f"[green]Review complete[/green] — "
+            f"verified: {verified}, rejected: {rejected}, still unclear: {unclear}"
         )
         return
 

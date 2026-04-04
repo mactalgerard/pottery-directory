@@ -220,7 +220,7 @@ def _build_queries(country: CountryCode) -> list[str]:
     return [f"{term}, {location}" for term in terms for location in locations]
 
 
-def _run_search_sync(client, query: str, limit: int) -> list[dict]:
+def _run_search_sync(client, query: str, limit: int, enrichment: list[str] | None = None) -> list[dict]:
     """
     Execute a single OutScraper Google Maps search query (synchronous).
 
@@ -228,15 +228,19 @@ def _run_search_sync(client, query: str, limit: int) -> list[dict]:
     OutScraper returns either a list of result dicts or a list of lists.
 
     Args:
-        client: Initialised outscraper.ApiClient.
-        query:  Search query string.
-        limit:  Maximum results to return.
+        client:     Initialised outscraper.ApiClient.
+        query:      Search query string.
+        limit:      Maximum results to return.
+        enrichment: Optional list of OutScraper enrichment services to apply,
+                    e.g. ["domains_service"] to populate website URLs.
 
     Returns:
         Flat list of result dicts. Empty list on error.
     """
     try:
-        results = client.google_maps_search(query, limit=limit, language="en")
+        results = client.google_maps_search(
+            query, limit=limit, language="en", enrichment=enrichment or []
+        )
         # SDK may return [[...results...]] or [...results...]
         if results and isinstance(results[0], list):
             return results[0]
@@ -264,10 +268,11 @@ def _normalise_row(raw: dict, country: CountryCode) -> dict:
     return {
         "name": raw.get("name"),
         "phone": raw.get("phone"),
-        "website": raw.get("site"),
-        "full_address": raw.get("full_address"),
+        "email": raw.get("email_1"),
+        "website": raw.get("website") or raw.get("site"),
+        "full_address": raw.get("full_address") or raw.get("address"),
         "city": raw.get("city"),
-        "state": raw.get("state") or raw.get("us_state"),
+        "state": raw.get("state") or raw.get("state_code") or raw.get("us_state"),
         "postal_code": raw.get("postal_code"),
         "working_hours": raw.get("working_hours"),
         "business_status": raw.get("business_status"),
@@ -327,18 +332,26 @@ async def collect_listings(
     country: CountryCode,
     limit_per_query: int = LIMIT_PER_QUERY,
     dry_run: bool = False,
+    enrichment: list[str] | None = None,
+    timeout_per_query: float = 60.0,
+    max_queries: int | None = None,
 ) -> Path:
     """
     Run the full OutScraper collect phase for a given country.
 
     Builds a matrix of search terms × locations, runs each query via the
     OutScraper API (synchronous SDK wrapped in asyncio thread executor),
-    deduplicates results, and writes the raw CSV.
+    deduplicates results on-the-fly, and appends rows to the CSV after each
+    query so progress is never lost if the run is interrupted.
 
     Args:
-        country:         Country code — "US", "CA", or "AU".
-        limit_per_query: Max results per search query. Default 500.
-        dry_run:         If True, print queries but skip API calls (for testing).
+        country:           Country code — "US", "CA", or "AU".
+        limit_per_query:   Max results per search query. Default 500.
+        dry_run:           If True, print queries but skip API calls.
+        enrichment:        OutScraper enrichment services. Defaults to
+                           ["domains_service"] to populate website URLs.
+        timeout_per_query: Seconds to wait for a single query before skipping.
+                           Default 60s.
 
     Returns:
         Path to the written raw CSV file (data/raw/{COUNTRY}/collect_{date}.csv).
@@ -347,6 +360,8 @@ async def collect_listings(
         EnvironmentError: if OUTSCRAPER_API_KEY is not set.
     """
     queries = _build_queries(country)
+    if max_queries:
+        queries = queries[:max_queries]
     total_queries = len(queries)
     console.print(
         f"[dim]OutScraper collect: {total_queries} queries for {country}[/dim]"
@@ -360,7 +375,22 @@ async def collect_listings(
 
     client = get_client()
     loop = asyncio.get_event_loop()
-    all_rows: list[dict] = []
+    enrichment_to_use = enrichment if enrichment is not None else ["domains_service"]
+
+    # Prepare output file — always start fresh, write header on first append
+    out_dir = RAW_DIR / country
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+    out_path = out_dir / f"collect_{run_date}.csv"
+    if out_path.exists():
+        out_path.unlink()
+    header_written = False
+
+    # Dedup state shared across all queries
+    seen_place_ids: set[str] = set()
+    seen_name_postal: set[tuple] = set()
+    total_written = 0
+    total_skipped = 0
 
     with Progress(
         SpinnerColumn(),
@@ -377,33 +407,52 @@ async def collect_listings(
                 description=f"[{i}/{total_queries}] {query}",
                 advance=1,
             )
-            raw_results = await loop.run_in_executor(
-                None, _run_search_sync, client, query, limit_per_query
-            )
+
+            try:
+                raw_results = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        None, _run_search_sync, client, query, limit_per_query, enrichment_to_use
+                    ),
+                    timeout=timeout_per_query,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Query timed out after %.0fs, skipping: %r", timeout_per_query, query)
+                continue
+
             normalised = [_normalise_row(r, country) for r in raw_results]
-            all_rows.extend(normalised)
-            logger.info("Query %r → %d results", query, len(normalised))
 
-    # Deduplicate across all queries
-    before = len(all_rows)
-    all_rows = _deduplicate_results(all_rows)
-    after = len(all_rows)
+            # Deduplicate on-the-fly and drop place_id before writing
+            new_rows: list[dict] = []
+            for row in normalised:
+                place_id = row.get("place_id")
+                name_postal = (
+                    (row.get("name") or "").lower().strip(),
+                    (row.get("postal_code") or "").strip(),
+                )
+                if place_id and place_id in seen_place_ids:
+                    total_skipped += 1
+                    continue
+                if not place_id and name_postal in seen_name_postal:
+                    total_skipped += 1
+                    continue
+                if place_id:
+                    seen_place_ids.add(place_id)
+                seen_name_postal.add(name_postal)
+                row.pop("place_id", None)
+                new_rows.append(row)
+
+            if new_rows:
+                pd.DataFrame(new_rows).to_csv(
+                    out_path, mode="a", index=False, header=not header_written
+                )
+                header_written = True
+                total_written += len(new_rows)
+
+            logger.info("Query %r → %d results (%d new)", query, len(normalised), len(new_rows))
+
     console.print(
-        f"[green]Collected {after} unique listings "
-        f"({before - after} duplicates removed across queries)[/green]"
+        f"[green]Collected {total_written} unique listings "
+        f"({total_skipped} duplicates removed across queries)[/green]"
     )
-
-    # Drop place_id before writing — it's not part of RawListing
-    for row in all_rows:
-        row.pop("place_id", None)
-
-    # Write CSV
-    out_dir = RAW_DIR / country
-    out_dir.mkdir(parents=True, exist_ok=True)
-    run_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-    out_path = out_dir / f"collect_{run_date}.csv"
-
-    df = pd.DataFrame(all_rows)
-    df.to_csv(out_path, index=False)
     console.print(f"[green]Saved raw CSV → {out_path}[/green]")
     return out_path
