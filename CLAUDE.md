@@ -3,15 +3,16 @@
 ## What This Project Is
 
 A data curation pipeline for building a niche directory of pottery and ceramics
-studios across the US, Canada, and Australia. The pipeline has three sequential
+studios across the US, Canada, and Australia. The pipeline has five sequential
 phases:
 
-  Phase 1 — COLLECT    Raw scrape from Google Maps via OutScraper CSV export
-  Phase 2 — CLEAN      Reject invalid listings, deduplicate, verify niche match
-  Phase 3 — ENRICH     Add niche-specific fields + generate listing descriptions
+  Phase 1 — COLLECT    Automated OutScraper Google Maps scrape (with domains_service enrichment)
+  Phase 2 — CLEAN      Hard rules, deduplication, Crawl4AI keyword-based niche verification
+  Phase 3 — REVIEW     Resolve flagged listings (no-website) via Claude web_search tool
+  Phase 4 — RESEARCH   Validate enrichment field definitions per country (Claude + web search)
+  Phase 5 — ENRICH     Crawl websites, extract niche fields, generate descriptions (Batch API)
 
-The output is a clean, enriched CSV (and optionally a Supabase database) ready
-for import into a directory CMS.
+Output: enriched CSVs in `data/enriched/{COUNTRY}/` and optionally upserted to Supabase.
 
 ## Critical Rules
 
@@ -30,66 +31,170 @@ for import into a directory CMS.
 ## Repo Layout
 
 ```
-context/                    Enrichment field definitions and niche rules (per country)
-data/raw/{US,CA,AU}/        OutScraper CSV exports (gitignored)
-data/cleaned/{US,CA,AU}/    Post-cleaning CSVs
-data/enriched/{US,CA,AU}/   Final enriched CSVs
-src/models.py               Pydantic models: RawListing, CleanListing, EnrichedListing
-src/tools/crawler.py        Crawl4AI wrapper — all crawling goes here
-src/tools/supabase_client.py Supabase upsert helpers
-src/agents/                 Three agents: researcher, cleaner, enrichment
-src/prompts/                System prompt markdown files for each agent
-pipeline.py                 Main entrypoint
+context/                         Enrichment field definitions and niche rules (per country)
+  enrichment_fields_{US,CA,AU}.md  Written by EnrichmentResearcherAgent; US validated
+  niche_verification_rules.md      Keyword rules used by CleanerAgent crawl verification
+data/raw/{US,CA,AU}/             OutScraper CSV exports (gitignored)
+data/cleaned/{US,CA,AU}/         cleaned / flagged / rejected CSVs
+data/enriched/{US,CA,AU}/        Final enriched CSVs + batch state JSON files
+supabase/migrations/             SQL migration files (001_create_listings_table.sql)
+src/models.py                    Pydantic models: RawListing, CleanListing, EnrichedListing
+src/tools/
+  crawler.py                     Crawl4AI wrapper — all crawling goes here
+  outscraper_client.py           OutScraper Google Maps API automation
+  supabase_client.py             Supabase CRUD helpers
+src/agents/
+  cleaner_agent.py               Hard rules + dedup + Crawl4AI niche verification
+  flagged_review_agent.py        Resolves no-website flagged listings via web search
+  enrichment_researcher.py       Validates enrichment fields per country (runs once)
+  enrichment_agent.py            Batch API enrichment — submit + retrieve/poll
+src/prompts/                     System prompt markdown files for each agent
+pipeline.py                      Main entrypoint
 ```
 
 ## Running the Pipeline
 
 ```bash
-python pipeline.py                             # Full pipeline, country=US
-python pipeline.py --country AU                # Scope entire run to Australia
-python pipeline.py --phase collect             # OutScraper scrape only for US
-python pipeline.py --phase collect --dry-run   # Print queries, skip API calls
-python pipeline.py --country CA --phase clean  # Clean phase only for Canada
-python pipeline.py --phase enrich              # Enrich only (latest cleaned CSV)
-python pipeline.py --phase research            # Run EnrichmentResearcherAgent only
-python pipeline.py --input data/raw/AU/my.csv  # Specify input file
-python pipeline.py --to-supabase               # Upsert enriched listings to Supabase
+# Collect
+python pipeline.py --phase collect --country US
+python pipeline.py --phase collect --dry-run          # Preview queries, skip API
+python pipeline.py --phase collect --max-queries 10   # Sample first N queries
+
+# Clean
+python pipeline.py --phase clean --country US
+
+# Review flagged listings
+python pipeline.py --phase review --country US
+
+# Research (validate enrichment fields — skips if context file exists)
+python pipeline.py --phase research --country US
+python pipeline.py --phase research --country US --force  # Re-run even if file exists
+
+# Enrich (Batch API — two steps)
+python pipeline.py --phase enrich --country US               # Submit batch
+python pipeline.py --phase enrich --country US --sample 10   # Submit sample of 10
+python pipeline.py --phase enrich --country US --retrieve     # Check status / write CSV
+python pipeline.py --phase enrich --country US --retrieve --poll  # Auto-poll every 5 min
+python pipeline.py --phase enrich --country US --label v2     # Tag run with label
+
+# Supabase
+python pipeline.py --to-supabase --country US                 # Upsert latest enriched CSV
+python pipeline.py --to-supabase --country US --input data/enriched/US/enriched_2026-04-04.csv
+python pipeline.py --delete-country --country CA              # Bulk delete (with confirmation)
+
+# Specify input file explicitly for any phase
+python pipeline.py --phase clean --country US --input data/raw/US/my.csv
 ```
 
 ## Current State
 
-Scaffold complete — stubs only except for the collect phase.
+US pipeline is fully complete end-to-end. CA and AU to be run after the website is set up.
 
-Collect phase is fully implemented (`src/tools/outscraper_client.py`).
-Run `python pipeline.py --phase collect --dry-run` to preview queries before hitting the API.
+| Phase    | US  | CA | AU |
+|----------|-----|----|----|
+| collect  | ✅  | —  | —  |
+| clean    | ✅  | —  | —  |
+| review   | ✅  | —  | —  |
+| research | ✅  | —  | —  |
+| enrich   | ✅  | —  | —  |
+| supabase | 🔄  | —  | —  |
 
-Next implementation task:
-  1. Run collect phase to get real data
-  2. Implement CleanerAgent rejection logic (pure Python, no LLM needed)
-  3. Confirm three output CSVs (cleaned / flagged / rejected) are correct
+US enriched output: `data/enriched/US/enriched_2026-04-04.csv` — 1,993 rows, 67.5% enriched.
+
+**Note on US data quality:** The 1,993-row enriched CSV was produced before Crawl4AI niche
+verification was implemented. Some borderline listings (paint-your-own, supply-only) may be
+present. A re-run of clean + enrich will produce a tighter dataset but is not required before
+website work begins.
+
+## Key Implementation Details
+
+### Collect Phase
+- Uses `domains_service` enrichment — populates `website` and `email` fields on every row
+- Output CSV deleted at the start of each run — prevents duplicate rows from appended re-runs on the same date
+- Incremental CSV writes per query — progress preserved if interrupted mid-run
+- 60s `asyncio.wait_for` timeout per query — slow/failing queries logged and skipped
+- Query matrix: US 240 (5 terms × 48 metros), CA 150 (5 × 30), AU 120 (6 × 20)
+- AU uses different search terms (`clay classes`, `hand building classes`)
+- `postal_code` coerced to `str` at ingest — pandas reads numeric zip codes as int
+- All CSV loaders use `math.isnan` check to convert `float NaN` → `None` before Pydantic instantiation
+
+### Clean Phase
+- Hard rules: `_is_closed`, `_is_incomplete_address`, `_is_missing_contact`
+- `_is_missing_hours` deliberately excluded — too aggressive for Google Maps data quality
+- Dedup: phone → address+postal+country → lat/lng within 50m (Haversine)
+- Niche verification: `crawl_many(concurrency=10)` batch-crawls all websites, then
+  `_verify_niche(listing, content)` applies keyword heuristics from `context/niche_verification_rules.md`
+- Three output CSVs: `cleaned_`, `flagged_`, `rejected_`
+
+### Niche Verification Keywords
+- **Positive:** pottery, ceramics, clay, wheel throwing, kiln, glazing, hand building, open studio, etc.
+- **Supply-only flag:** pottery supplies, pottery supply, ceramic supplies, kilns for sale
+- **Paint-your-own flag:** paint your own, color me mine
+- **Hard negative (reject):** restaurant, real estate, michaels, hobby lobby
+
+### FlaggedReviewAgent
+- Uses Claude `web_search_20250305` native tool
+- `submit_verdict` custom tool with structured output: `verified` / `rejected` / `unclear`
+- `CONCURRENCY = 1` — sequential to avoid 30k tokens/min rate limit
+- Retry with exponential backoff on 429 errors (`[60, 120]` seconds)
+- Per-row incremental CSV writes — restartable if interrupted
+
+### EnrichmentResearcherAgent
+- Model: `claude-opus-4-6` (runs once per country)
+- Web search with `max_uses: 10`
+- Skips if `context/enrichment_fields_{COUNTRY}.md` exists unless `--force`
+- US fields validated: 9 original + 5 new (open_studio_access, firing_services, byob_events, date_night, membership_model)
+
+### EnrichmentAgent (Batch API)
+- Step 1 (submit): crawl all websites → embed content in batch requests → `extract_fields` tool with `tool_choice: forced`
+- Step 2 (retrieve): `--retrieve` checks once; `--retrieve --poll` loops every 5 min with macOS notification
+- Batch state persisted to `data/enriched/{COUNTRY}/batch_state{_label}.json`
+- `--sample N` auto-sets label to `sampleN` — isolated from full run files
+- `_clean_string_fields()` strips accidental surrounding quotes from string values
+- No web search fallback — crawl failures → null enrichment fields (null over invention)
+- MAX_CONTENT_CHARS = 12,000 (~3,000 tokens) — truncated in `crawler.py`
+- `crawl_many` uses a hard outer timeout (`asyncio.wait_for(crawl_website(...), timeout=timeout+10)`) — catches DNS/connection hangs that bypass Playwright's `page_timeout`
+
+### Supabase
+- Table: `listings`, composite PK: `(name, postal_code, country)`
+- Migration: `supabase/migrations/001_create_listings_table.sql`
+- All sync supabase-py calls wrapped in `asyncio.to_thread()`
+- `upsert_listings`: `on_conflict="name,postal_code,country"` — idempotent re-runs
+- `--to-supabase` is a standalone CLI step (no `--phase` required)
+- `--delete-country` bulk deletes all rows for a country with confirmation prompt
+- Single-row deletes: use `delete_listing()` directly or the Supabase dashboard
 
 ## Tech Stack
 
 - Python 3.11+
-- `anthropic` — Claude API (claude-sonnet-4-20250514, tool_use pattern)
-- `crawl4ai` — async website crawling
-- `supabase` — optional storage backend
-- `pydantic` — data models with validation
+- `anthropic` — Claude API (tool_use pattern + Batch API)
+- `crawl4ai` 0.8.6 — async website crawling (`fit_markdown` output)
+- `supabase` ≥2.0.0 — Postgres storage backend
+- `pydantic` — data models with strict validation
 - `pandas` — CSV ingestion and export
 - `python-dotenv` — environment variables
-- `asyncio` — parallel enrichment runs
-- `rich` — terminal output (panels for agent thoughts, tables for summaries)
+- `asyncio` — concurrency (crawl_many semaphore, batch polling)
+- `rich` — terminal output (panels, tables, progress)
+- `outscraper` — Google Maps API client
 
-## Supabase Table
+## Models
 
-Table: `listings`
-Primary key: composite (name + postal_code + country)
-Country prevents cross-market collisions between identical names/postcodes.
+| Model | Agent | Rationale |
+|-------|-------|-----------|
+| `claude-opus-4-6` | EnrichmentResearcherAgent | Runs once; quality matters |
+| `claude-sonnet-4-6` | EnrichmentAgent, FlaggedReviewAgent | Cost/quality balance for batch work |
+
+## Supabase Environment Variables
+
+```
+SUPABASE_URL   — https://your-project.supabase.co
+SUPABASE_KEY   — service role key (not the anon key)
+```
 
 ## Countries Supported
 
-| Country       | Code | DataForSEO location_code | Currency |
-|---------------|------|--------------------------|----------|
-| United States | US   | 2840                     | USD      |
-| Canada        | CA   | 2124                     | CAD      |
-| Australia     | AU   | 2036                     | AUD      |
+| Country       | Code | Currency | OutScraper queries |
+|---------------|------|----------|--------------------|
+| United States | US   | USD      | 240 (5 × 48 metros) |
+| Canada        | CA   | CAD      | 150 (5 × 30 metros) |
+| Australia     | AU   | AUD      | 120 (6 × 20 metros) |

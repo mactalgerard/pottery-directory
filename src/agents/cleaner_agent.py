@@ -140,24 +140,55 @@ def _apply_hard_rules(listing: RawListing) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Niche verification (via Crawl4AI)
+# Niche verification (keyword heuristics on pre-crawled content)
 # ---------------------------------------------------------------------------
 
+# Positive signals — any match confirms this is a pottery/ceramics venue
+_POSITIVE_KEYWORDS = [
+    "pottery", "ceramics", "ceramic", "clay", "wheel throwing",
+    "kiln", "glazing", "hand building", "clay classes", "potter",
+    "stoneware", "earthenware", "throwing", "open studio",
+    "atelier de poterie", "céramique", "poterie",  # CA French
+]
 
-async def _verify_niche(listing: RawListing) -> tuple[bool, Optional[str]]:
+# Supply-only signals — retailer without a working studio
+_SUPPLY_ONLY_SIGNALS = [
+    "pottery supplies", "pottery supply", "ceramic supplies",
+    "kilns for sale", "clay supplier",
+]
+
+# Studio/class signals — counterweigh supply-only signals if present
+_STUDIO_SIGNALS = [
+    "classes", "workshop", "studio", "lessons", "membership",
+    "open studio", "wheel", "throw", "hand build",
+]
+
+# Paint-your-own — different activity, flag for human review
+_PAINT_YOUR_OWN_SIGNALS = [
+    "paint your own", "paint-your-own", "color me mine", "painting pottery",
+    "painted pottery",
+]
+
+# Hard negatives — clearly unrelated; reject only when no positive keywords present
+_HARD_NEGATIVE_KEYWORDS = [
+    "restaurant", "real estate", "michaels", "hobby lobby",
+    "art supply store", "arts and crafts supply",
+]
+
+
+def _verify_niche(listing: RawListing, content: Optional[str]) -> tuple[bool, Optional[str]]:
     """
-    Confirm the listing is a pottery/ceramics studio by crawling its website.
+    Confirm the listing is a pottery/ceramics studio using pre-crawled website content.
 
     Verification outcomes:
       (True, None)              — confirmed pottery/ceramics studio
-      (False, "flag: ...")      — pottery supply retailer without studio access
-                                  (needs human review, not auto-rejected)
-      (False, "rejected: ...")  — general craft store, unrelated business
-
-    If the listing has no website, returns (False, "flag: no website to verify").
+      (False, "flag: ...")      — needs human review (crawl failed, paint-your-own,
+                                  supply-only, or no matching keywords)
+      (False, "rejected: ...")  — clearly unrelated business
 
     Args:
-        listing: The RawListing whose website will be crawled.
+        listing: The RawListing being evaluated.
+        content: Pre-crawled website markdown (or None if crawl failed / no website).
 
     Returns:
         Tuple of (is_verified_niche, rejection_or_flag_reason).
@@ -165,10 +196,30 @@ async def _verify_niche(listing: RawListing) -> tuple[bool, Optional[str]]:
     if not listing.website:
         return False, "flag: no website — manual niche verification required"
 
-    # TODO: implement when crawler.py is ready
-    # crawler.crawl_website(listing.website) → apply keyword heuristics
-    # For now, tentatively pass listings with a website (pending real crawl verification)
-    return True, None
+    if content is None:
+        return False, "flag: crawl failed — manual niche verification required"
+
+    text = content.lower()
+
+    has_positive = any(kw in text for kw in _POSITIVE_KEYWORDS)
+    has_negative = any(kw in text for kw in _HARD_NEGATIVE_KEYWORDS)
+    has_paint_your_own = any(kw in text for kw in _PAINT_YOUR_OWN_SIGNALS)
+    has_supply_only = any(kw in text for kw in _SUPPLY_ONLY_SIGNALS)
+    has_studio = any(kw in text for kw in _STUDIO_SIGNALS)
+
+    if has_negative and not has_positive:
+        return False, "rejected: unrelated business"
+
+    if has_paint_your_own:
+        return False, "flag: paint-your-own pottery — manual niche verification required"
+
+    if has_supply_only and not has_studio:
+        return False, "flag: pottery supply retailer — no studio/classes evidence"
+
+    if has_positive:
+        return True, None
+
+    return False, "flag: no pottery keywords found in website content"
 
 
 # ---------------------------------------------------------------------------
@@ -291,9 +342,6 @@ def _write_outputs(
     out_dir = CLEANED_DIR / country
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_dir = CLEANED_DIR / country
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     paths = []
     for label, lst in [("cleaned", cleaned), ("flagged", flagged), ("rejected", rejected)]:
         path = out_dir / f"{label}_{run_date}.csv"
@@ -341,8 +389,6 @@ async def run(
 
     run_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
 
-    run_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
-
     # Step 1 — deduplicate
     before = len(raw_listings)
     deduped = deduplicate(raw_listings, country)
@@ -364,12 +410,18 @@ async def run(
             passed.append(listing)
 
     # Step 3 — niche verification
-    # Crawler not yet implemented; listings with a website are tentatively verified,
-    # listings without a website are flagged for manual review.
+    # Batch-crawl all websites, then apply keyword heuristics per listing.
+    console.print(f"[dim]Crawling {sum(1 for l in passed if l.website)} websites for niche verification…[/dim]")
+    urls_to_crawl = [l.website for l in passed if l.website]
+    crawl_results: dict[str, Optional[str]] = {}
+    if urls_to_crawl:
+        crawl_results = await crawler.crawl_many(urls_to_crawl, concurrency=10)
+
     cleaned: list[CleanListing] = []
     flagged: list[CleanListing] = []
     for listing in passed:
-        verified, flag_reason = await _verify_niche(listing)
+        content = crawl_results.get(listing.website) if listing.website else None
+        verified, flag_reason = _verify_niche(listing, content)
         if verified:
             cleaned.append(CleanListing(
                 **listing.model_dump(),

@@ -14,6 +14,7 @@ Environment variables required:
   SUPABASE_KEY  — service role key (not the anon key)
 """
 
+import asyncio
 import logging
 import os
 from typing import Optional
@@ -38,10 +39,15 @@ def get_client():
     Returns:
         A supabase.Client instance ready for queries.
     """
-    # TODO: Read SUPABASE_URL and SUPABASE_KEY from os.environ
-    # TODO: Raise EnvironmentError with a clear message if either is missing
-    # TODO: Return supabase.create_client(url, key)
-    raise NotImplementedError
+    from supabase import create_client
+
+    url = os.environ.get("SUPABASE_URL")
+    key = os.environ.get("SUPABASE_KEY")
+    if not url or not key:
+        raise EnvironmentError(
+            "SUPABASE_URL and SUPABASE_KEY must be set in environment or .env file"
+        )
+    return create_client(url, key)
 
 
 async def upsert_listings(listings: list[EnrichedListing]) -> dict:
@@ -59,11 +65,104 @@ async def upsert_listings(listings: list[EnrichedListing]) -> dict:
           "upserted" (int)  — number of rows successfully upserted
           "errors"   (list) — list of error dicts for any rows that failed
     """
-    # TODO: Serialise each listing to dict via .model_dump() with mode="json"
-    # TODO: Call supabase.table("listings").upsert(rows, on_conflict="name,postal_code,country")
-    # TODO: Collect and log any errors without raising — return them in "errors"
-    # TODO: Return {"upserted": count, "errors": error_list}
-    raise NotImplementedError
+    client = get_client()
+    rows = [l.model_dump(mode="json") for l in listings]
+    errors = []
+
+    def _do_upsert():
+        return (
+            client.table("listings")
+            .upsert(rows, on_conflict="name,postal_code,country")
+            .execute()
+        )
+
+    try:
+        response = await asyncio.to_thread(_do_upsert)
+        upserted = len(response.data) if response.data else len(rows)
+    except Exception as exc:
+        logger.error("Supabase upsert failed: %s", exc)
+        errors.append({"error": str(exc), "rows": len(rows)})
+        upserted = 0
+
+    if errors:
+        logger.warning("%d upsert error(s) encountered", len(errors))
+
+    return {"upserted": upserted, "errors": errors}
+
+
+async def delete_listing(name: str, postal_code: str, country: str) -> dict:
+    """
+    Delete a single listing by its composite primary key.
+
+    Args:
+        name:        Listing name.
+        postal_code: Postal code string.
+        country:     Country code — "US", "CA", or "AU".
+
+    Returns:
+        Dict with keys:
+          "deleted" (int)  — 1 if the row was found and deleted, 0 otherwise
+          "errors"  (list) — list of error dicts if the operation failed
+    """
+    client = get_client()
+    errors = []
+
+    def _do_delete():
+        return (
+            client.table("listings")
+            .delete()
+            .eq("name", name)
+            .eq("postal_code", postal_code)
+            .eq("country", country)
+            .execute()
+        )
+
+    try:
+        response = await asyncio.to_thread(_do_delete)
+        deleted = len(response.data) if response.data else 0
+    except Exception as exc:
+        logger.error("Supabase delete_listing failed: %s", exc)
+        errors.append({"error": str(exc)})
+        deleted = 0
+
+    return {"deleted": deleted, "errors": errors}
+
+
+async def delete_listings_by_country(country: str) -> dict:
+    """
+    Bulk delete all listings for a country.
+
+    Intended as a reset before re-importing a cleaner dataset. Use with care —
+    this removes every row for the given country with no further confirmation.
+
+    Args:
+        country: Country code — "US", "CA", or "AU".
+
+    Returns:
+        Dict with keys:
+          "deleted" (int)  — number of rows deleted
+          "errors"  (list) — list of error dicts if the operation failed
+    """
+    client = get_client()
+    errors = []
+
+    def _do_delete():
+        return (
+            client.table("listings")
+            .delete()
+            .eq("country", country)
+            .execute()
+        )
+
+    try:
+        response = await asyncio.to_thread(_do_delete)
+        deleted = len(response.data) if response.data else 0
+    except Exception as exc:
+        logger.error("Supabase delete_listings_by_country failed: %s", exc)
+        errors.append({"error": str(exc)})
+        deleted = 0
+
+    return {"deleted": deleted, "errors": errors}
 
 
 async def query_listings(
@@ -82,7 +181,16 @@ async def query_listings(
     Returns:
         List of raw dicts from Supabase (not yet cast to EnrichedListing).
     """
-    # TODO: Query supabase.table("listings").select("*").eq("country", country)
-    # TODO: Apply .range(offset, offset + limit - 1)
-    # TODO: Return response.data
-    raise NotImplementedError
+    client = get_client()
+
+    def _do_query():
+        return (
+            client.table("listings")
+            .select("*")
+            .eq("country", country)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+
+    response = await asyncio.to_thread(_do_query)
+    return response.data or []

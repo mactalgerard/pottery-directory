@@ -32,7 +32,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.agents import cleaner_agent, enrichment_agent, enrichment_researcher, flagged_review_agent
-from src.models import CleanListing, CountryCode, RawListing
+from src.models import CleanListing, CountryCode, EnrichedListing, RawListing
 from src.tools import outscraper_client, supabase_client
 
 load_dotenv()
@@ -44,6 +44,7 @@ VALID_PHASES = ["collect", "research", "clean", "review", "enrich"]
 
 RAW_DIR = Path("data/raw")
 CLEANED_DIR = Path("data/cleaned")
+ENRICHED_DIR = Path("data/enriched")
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,86 @@ def load_clean_csv(path: Path, country: CountryCode) -> list[CleanListing]:
     return listings
 
 
+def find_latest_enriched_csv(country: CountryCode) -> Path:
+    """
+    Find the most recently modified enriched CSV in data/enriched/{COUNTRY}/.
+
+    Only looks for files matching enriched_{date}*.csv pattern.
+
+    Args:
+        country: Country code — determines which subdirectory to search.
+
+    Returns:
+        Path to the most recently modified enriched CSV.
+
+    Raises:
+        FileNotFoundError: if no enriched CSVs exist (run enrich phase first).
+    """
+    enriched_dir = ENRICHED_DIR / country
+    csvs = sorted(
+        enriched_dir.glob("enriched_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    if not csvs:
+        raise FileNotFoundError(
+            f"No enriched CSV files found in {enriched_dir}. "
+            f"Run `python pipeline.py --country {country} --phase enrich --retrieve` first."
+        )
+    return csvs[0]
+
+
+def load_enriched_csv(path: Path, country: CountryCode) -> list[EnrichedListing]:
+    """
+    Load an enriched CSV into a list of EnrichedListing objects.
+
+    Handles NaN → None coercion and type casting for numeric, boolean, and
+    datetime fields.
+
+    Args:
+        path:    Path to the enriched CSV.
+        country: Country code — used to override the country column defensively.
+
+    Returns:
+        List of EnrichedListing objects.
+    """
+    import math
+
+    df = pd.read_csv(path)
+    records = df.to_dict(orient="records")
+
+    listings: list[EnrichedListing] = []
+    for record in records:
+        for key, value in record.items():
+            if isinstance(value, float) and math.isnan(value):
+                record[key] = None
+
+        for field in ("latitude", "longitude"):
+            if record.get(field) is not None:
+                try:
+                    record[field] = float(record[field])
+                except (ValueError, TypeError):
+                    record[field] = None
+        if record.get("reviews_count") is not None:
+            try:
+                record["reviews_count"] = int(float(record["reviews_count"]))
+            except (ValueError, TypeError):
+                record["reviews_count"] = None
+        if record.get("postal_code") is not None:
+            record["postal_code"] = str(record["postal_code"])
+        for bool_field in ("is_verified_niche", "drop_in_available", "booking_required",
+                           "sells_supplies", "kids_classes", "private_events",
+                           "open_studio_access", "firing_services", "byob_events", "date_night"):
+            if record.get(bool_field) is not None:
+                record[bool_field] = bool(record[bool_field])
+
+        record["country"] = country
+        try:
+            listings.append(EnrichedListing(**record))
+        except Exception as exc:
+            logger.warning("Skipping malformed row %r: %s", record.get("name"), exc)
+
+    return listings
+
+
 # ---------------------------------------------------------------------------
 # Phase runners
 # ---------------------------------------------------------------------------
@@ -385,6 +466,69 @@ async def run_poll(country: CountryCode, label: str = "") -> None:
         label:   Run label — must match the label used during submit.
     """
     await enrichment_agent.poll(country, label=label)
+
+
+async def run_supabase_upsert(
+    country: CountryCode,
+    input_path: Path | None = None,
+) -> dict:
+    """
+    Upsert enriched listings from a CSV into Supabase.
+
+    Loads the enriched CSV (from --input or the latest enriched_*.csv),
+    serialises each row, and calls upsert_listings() with on_conflict handling.
+
+    Args:
+        country:    Country code.
+        input_path: Explicit path to an enriched CSV, or None to use latest.
+
+    Returns:
+        Dict with "upserted" (int) and "errors" (list) from upsert_listings().
+    """
+    path = input_path or find_latest_enriched_csv(country)
+    console.print(f"[dim]Loading enriched CSV: {path}[/dim]")
+    listings = load_enriched_csv(path, country)
+    console.print(f"[dim]Upserting {len(listings)} listings to Supabase…[/dim]")
+    result = await supabase_client.upsert_listings(listings)
+    console.print(
+        f"[green]Upserted {result['upserted']} rows[/green]"
+        + (f" [red]({len(result['errors'])} errors)[/red]" if result["errors"] else "")
+    )
+    for err in result["errors"]:
+        logger.error("Supabase error: %s", err)
+    return result
+
+
+async def run_delete_country(country: CountryCode) -> dict:
+    """
+    Bulk delete all Supabase listings for a country after user confirmation.
+
+    Prints a confirmation prompt before executing — this is a destructive
+    operation that cannot be undone without re-running the pipeline.
+
+    Args:
+        country: Country code whose listings will be deleted.
+
+    Returns:
+        Dict with "deleted" (int) and "errors" (list) from delete_listings_by_country().
+    """
+    console.print(
+        f"[bold yellow]WARNING:[/bold yellow] This will permanently delete all "
+        f"[bold]{country}[/bold] listings from Supabase."
+    )
+    confirm = input(f"Type '{country}' to confirm, or anything else to cancel: ").strip()
+    if confirm != country:
+        console.print("[dim]Cancelled.[/dim]")
+        return {"deleted": 0, "errors": []}
+
+    result = await supabase_client.delete_listings_by_country(country)
+    console.print(
+        f"[green]Deleted {result['deleted']} {country} listings[/green]"
+        + (f" [red]({len(result['errors'])} errors)[/red]" if result["errors"] else "")
+    )
+    for err in result["errors"]:
+        logger.error("Supabase error: %s", err)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -535,6 +679,12 @@ def parse_args() -> argparse.Namespace:
         metavar="NAME",
         help="Enrich phase: label for this run, appended to output filenames (e.g. 'sample10').",
     )
+    parser.add_argument(
+        "--delete-country",
+        action="store_true",
+        default=False,
+        help="Delete all Supabase listings for --country. Prompts for confirmation before executing.",
+    )
     return parser.parse_args()
 
 
@@ -560,6 +710,16 @@ async def main() -> None:
             style="blue",
         )
     )
+
+    # Standalone: --delete-country
+    if args.delete_country:
+        await run_delete_country(country)
+        return
+
+    # Standalone: --to-supabase (no --phase required)
+    if args.to_supabase and not args.phase:
+        await run_supabase_upsert(country, args.input)
+        return
 
     # Phase: collect only
     if args.phase == "collect":
