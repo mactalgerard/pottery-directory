@@ -88,7 +88,7 @@ python pipeline.py --phase clean --country US --input data/raw/US/my.csv
 
 ## Current State
 
-US pipeline is fully complete end-to-end. CA and AU to be run after the website is set up.
+US pipeline fully complete end-to-end. CA and AU to be run after the website is set up.
 
 | Phase    | US  | CA | AU |
 |----------|-----|----|----|
@@ -97,14 +97,27 @@ US pipeline is fully complete end-to-end. CA and AU to be run after the website 
 | review   | ✅  | —  | —  |
 | research | ✅  | —  | —  |
 | enrich   | ✅  | —  | —  |
-| supabase | 🔄  | —  | —  |
+| supabase | ✅  | —  | —  |
 
 US enriched output: `data/enriched/US/enriched_2026-04-04.csv` — 1,993 rows, 67.5% enriched.
+Supabase upsert confirmed complete as of 2026-04-05 — all 1,993 US listings live in the `listings` table.
 
 **Note on US data quality:** The 1,993-row enriched CSV was produced before Crawl4AI niche
 verification was implemented. Some borderline listings (paint-your-own, supply-only) may be
 present. A re-run of clean + enrich will produce a tighter dataset but is not required before
 website work begins.
+
+## Website
+
+The frontend website (ClayFinder) is a separate project located at `~/Desktop/Projects/clayfinder`.
+See `clayfinder/CLAUDE.md` for full website context.
+
+Key decisions made during 2026-04-05 planning session:
+- Domain: `clayfinder.com` (registered via Porkbun)
+- Keyword cluster validated via DataForSEO — see `context/keyword_cluster.md`
+- Primary keywords: "pottery classes near me" (KD 4, 110k SV) + "ceramics classes near me" (KD 3, 110k SV)
+- Main competitor: ClassBento (marketplace model, not a free directory)
+- Monetization: display ads primary, lead gen secondary at 10k+/month traffic
 
 ## Key Implementation Details
 
