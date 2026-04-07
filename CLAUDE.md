@@ -18,8 +18,11 @@ Output: enriched CSVs in `data/enriched/{COUNTRY}/` and optionally upserted to S
 
 - **Country is always explicit.** The `--country` flag (US / CA / AU) scopes
   every phase. Never infer country from data. If country is ambiguous, raise.
-- **Each country is an independent run.** Enrichment field definitions, prompts,
-  and price conventions differ per market and must not be mixed.
+- **Each country is an independent run.** Prompts and price conventions are
+  country-scoped and must not be mixed.
+- **Enrichment fields are uniform across all countries.** The same 14 fields apply
+  to US, CA, and AU. Do not add country-specific fields without updating all three
+  context files and the Supabase schema.
 - **Agents never call Crawl4AI directly.** All crawling goes through
   `src/tools/crawler.py`.
 - **Agents communicate via tool_use only** — never string parsing of LLM output.
@@ -32,7 +35,7 @@ Output: enriched CSVs in `data/enriched/{COUNTRY}/` and optionally upserted to S
 
 ```
 context/                         Enrichment field definitions and niche rules (per country)
-  enrichment_fields_{US,CA,AU}.md  Written by EnrichmentResearcherAgent; US validated
+  enrichment_fields_{US,CA,AU}.md  All three validated; uniform 14-field schema across countries
   niche_verification_rules.md      Keyword rules used by CleanerAgent crawl verification
 data/raw/{US,CA,AU}/             OutScraper CSV exports (gitignored)
 data/cleaned/{US,CA,AU}/         cleaned / flagged / rejected CSVs
@@ -88,19 +91,33 @@ python pipeline.py --phase clean --country US --input data/raw/US/my.csv
 
 ## Current State
 
-US pipeline fully complete end-to-end. CA and AU to be run after the website is set up.
+All three country pipelines fully complete end-to-end.
+
+**Phase 4 (research) is skipped for CA and AU** — enrichment fields are pre-validated
+with the same 14-field schema as US. Context files at `context/enrichment_fields_{CA,AU}.md`
+are already populated; no agent run needed.
 
 | Phase    | US  | CA | AU |
 |----------|-----|----|----|
-| collect  | ✅  | —  | —  |
-| clean    | ✅  | —  | —  |
-| review   | ✅  | —  | —  |
-| research | ✅  | —  | —  |
-| enrich   | ✅  | —  | —  |
-| supabase | ✅  | —  | —  |
+| collect  | ✅  | ✅ | ✅ |
+| clean    | ✅  | ✅ | ✅ |
+| review   | ✅  | ✅ | ✅ |
+| research | ✅  | ✅ | ✅ |
+| enrich   | ✅  | ✅ | ✅ |
+| supabase | ✅  | ✅ | ✅ |
 
 US enriched output: `data/enriched/US/enriched_2026-04-04.csv` — 1,993 rows, 67.5% enriched.
 Supabase upsert confirmed complete as of 2026-04-05 — all 1,993 US listings live in the `listings` table.
+
+AU enriched output: `data/enriched/AU/enriched_2026-04-06.csv` — 330 rows (cleaned from 359), 78.3% enriched.
+Supabase upsert confirmed complete as of 2026-04-06 — all 330 AU listings live in the `listings` table.
+29 US-state contaminated rows and 10 state abbreviation rows removed during 2026-04-06 data quality pass.
+
+CA raw: `data/raw/CA/collect_2026-04-06.csv` — 830 rows.
+CA cleaned: `data/cleaned/CA/cleaned_2026-04-06.csv` — 440 rows after review phase (388 from clean + verified from flagged review).
+CA enriched output: `data/enriched/CA/enriched_2026-04-06.csv` — 440 rows, 78.0% partially enriched, 22.0% zero-enrichment (crawl failures).
+Supabase upsert confirmed complete as of 2026-04-07 — all 440 CA listings live in the `listings` table.
+5 province abbreviation rows (ON, MB, AB) manually normalised to full names before upsert on 2026-04-07.
 
 **Note on US data quality:** The 1,993-row enriched CSV was produced before Crawl4AI niche
 verification was implemented. Some borderline listings (paint-your-own, supply-only) may be
@@ -128,12 +145,19 @@ Key decisions made during 2026-04-05 planning session:
 - 60s `asyncio.wait_for` timeout per query — slow/failing queries logged and skipped
 - Query matrix: US 240 (5 terms × 48 metros), CA 150 (5 × 30), AU 120 (6 × 20)
 - AU uses different search terms (`clay classes`, `hand building classes`)
+- **CA locations use `"City, Province, Canada"` format** (e.g. `"London, Ontario, Canada"`) — prevents
+  OutScraper from resolving ambiguous city names to foreign countries (London UK, Burlington VT, etc.)
 - `postal_code` coerced to `str` at ingest — pandas reads numeric zip codes as int
 - All CSV loaders use `math.isnan` check to convert `float NaN` → `None` before Pydantic instantiation
 
 ### Clean Phase
-- Hard rules: `_is_closed`, `_is_incomplete_address`, `_is_missing_contact`
+- Hard rules: `_is_closed`, `_is_incomplete_address`, `_is_missing_contact`, `_is_wrong_region`
 - `_is_missing_hours` deliberately excluded — too aggressive for Google Maps data quality
+- `_is_wrong_region(listing, country)` rejects listings whose `state` field is non-null and not in
+  `_VALID_REGIONS[country]` — catches geographic contamination from ambiguous OutScraper queries
+- `_normalise_state(state, country)` expands abbreviations to full names (ON→Ontario, VIC→Victoria,
+  etc.) using `_STATE_ABBREVIATIONS` dict — applied before hard rules so all output CSVs use
+  consistent full-name states
 - Dedup: phone → address+postal+country → lat/lng within 50m (Haversine)
 - Niche verification: `crawl_many(concurrency=10)` batch-crawls all websites, then
   `_verify_niche(listing, content)` applies keyword heuristics from `context/niche_verification_rules.md`
@@ -157,6 +181,8 @@ Key decisions made during 2026-04-05 planning session:
 - Web search with `max_uses: 10`
 - Skips if `context/enrichment_fields_{COUNTRY}.md` exists unless `--force`
 - US fields validated: 9 original + 5 new (open_studio_access, firing_services, byob_events, date_night, membership_model)
+- **CA and AU skip this phase** — context files pre-populated with the same 14-field schema on 2026-04-06;
+  only currency labels and country-specific notes differ
 
 ### EnrichmentAgent (Batch API)
 - Step 1 (submit): crawl all websites → embed content in batch requests → `extract_fields` tool with `tool_choice: forced`
@@ -167,6 +193,7 @@ Key decisions made during 2026-04-05 planning session:
 - No web search fallback — crawl failures → null enrichment fields (null over invention)
 - MAX_CONTENT_CHARS = 12,000 (~3,000 tokens) — truncated in `crawler.py`
 - `crawl_many` uses a hard outer timeout (`asyncio.wait_for(crawl_website(...), timeout=timeout+10)`) — catches DNS/connection hangs that bypass Playwright's `page_timeout`
+- `load_enriched_csv` uses `ast.literal_eval` to parse `class_types` and `skill_levels` back from CSV string representation to proper Python lists before Pydantic validation
 
 ### Supabase
 - Table: `listings`, composite PK: `(name, postal_code, country)`
@@ -176,6 +203,9 @@ Key decisions made during 2026-04-05 planning session:
 - `--to-supabase` is a standalone CLI step (no `--phase` required)
 - `--delete-country` bulk deletes all rows for a country with confirmation prompt
 - Single-row deletes: use `delete_listing()` directly or the Supabase dashboard
+- **RLS is disabled** on the `listings` table — not needed for a backend-only pipeline table
+- `anon` and `authenticated` roles have SELECT only — INSERT/UPDATE/DELETE revoked
+- `service_role` key retains full write access and is what the pipeline uses
 
 ## Tech Stack
 

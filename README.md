@@ -9,7 +9,7 @@ studios across the US, Canada, and Australia.
 Phase 1 — COLLECT    Automated OutScraper Google Maps scrape (with domains_service enrichment)
 Phase 2 — CLEAN      Hard rules, deduplication, Crawl4AI niche verification
 Phase 3 — REVIEW     Resolve flagged listings (no-website) via Claude web search
-Phase 4 — RESEARCH   Validate enrichment field definitions per country via Claude + web search
+Phase 4 — RESEARCH   Validate enrichment field definitions (US only — CA/AU use same 14-field schema)
 Phase 5 — ENRICH     Crawl websites, extract niche fields, generate descriptions (Batch API)
 ```
 
@@ -75,8 +75,12 @@ python pipeline.py --phase review --country US --input data/cleaned/US/flagged_2
 
 ### Research
 
+> **CA and AU skip this phase.** Enrichment fields are uniform across all countries —
+> `context/enrichment_fields_{CA,AU}.md` are pre-populated with the same 14-field schema as US.
+> Only run research for US, or to force-update the US field definitions.
+
 ```bash
-# Validate enrichment field definitions for a country (runs once, skips if file exists)
+# Validate enrichment field definitions for US (runs once, skips if file exists)
 python pipeline.py --phase research --country US
 
 # Force re-run even if the context file already exists
@@ -153,6 +157,6 @@ src/prompts/                    ← system prompt markdown files for each agent
 
 | Country | Collect | Clean | Review | Research | Enrich | Supabase |
 |---------|---------|-------|--------|----------|--------|----------|
-| US      | ✅      | ✅    | ✅     | ✅       | ✅     | —        |
-| CA      | —       | —     | —      | —        | —      | —        |
-| AU      | —       | —     | —      | —        | —      | —        |
+| US      | ✅      | ✅    | ✅     | ✅       | ✅     | ✅       |
+| CA      | —       | —     | —      | ✅ (pre-validated) | — | —   |
+| AU      | ✅      | —     | —      | ✅ (pre-validated) | — | —   |

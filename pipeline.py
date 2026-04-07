@@ -280,6 +280,7 @@ def load_enriched_csv(path: Path, country: CountryCode) -> list[EnrichedListing]
     Returns:
         List of EnrichedListing objects.
     """
+    import ast
     import math
 
     df = pd.read_csv(path)
@@ -309,6 +310,13 @@ def load_enriched_csv(path: Path, country: CountryCode) -> list[EnrichedListing]
                            "open_studio_access", "firing_services", "byob_events", "date_night"):
             if record.get(bool_field) is not None:
                 record[bool_field] = bool(record[bool_field])
+        for list_field in ("class_types", "skill_levels"):
+            val = record.get(list_field)
+            if isinstance(val, str):
+                try:
+                    record[list_field] = ast.literal_eval(val)
+                except (ValueError, SyntaxError):
+                    record[list_field] = None
 
         record["country"] = country
         try:

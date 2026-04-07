@@ -36,6 +36,77 @@ CLEANED_DIR = Path("data/cleaned")
 # Distance threshold for lat/lng deduplication (metres)
 DEDUP_RADIUS_METRES = 50
 
+# Abbreviation → full name mappings per country.
+# Applied during cleaning so all output CSVs use consistent full names.
+_STATE_ABBREVIATIONS: dict[str, dict[str, str]] = {
+    "AU": {
+        "NSW": "New South Wales",
+        "VIC": "Victoria",
+        "QLD": "Queensland",
+        "WA": "Western Australia",
+        "SA": "South Australia",
+        "TAS": "Tasmania",
+        "ACT": "Australian Capital Territory",
+        "NT": "Northern Territory",
+    },
+    "CA": {
+        "ON": "Ontario",
+        "BC": "British Columbia",
+        "QC": "Quebec",
+        "AB": "Alberta",
+        "MB": "Manitoba",
+        "SK": "Saskatchewan",
+        "NS": "Nova Scotia",
+        "NB": "New Brunswick",
+        "PE": "Prince Edward Island",
+        "NL": "Newfoundland and Labrador",
+        "NT": "Northwest Territories",
+        "YT": "Yukon",
+        "YK": "Yukon",
+        "NU": "Nunavut",
+    },
+    "US": {},  # US abbreviations are standard and widely accepted — no expansion needed
+}
+
+# Valid province/state/territory values per country.
+# Includes both full names and common abbreviations as OutScraper returns either.
+_VALID_REGIONS: dict[str, set[str]] = {
+    "CA": {
+        # Full names
+        "Ontario", "British Columbia", "Quebec", "Alberta", "Manitoba",
+        "Saskatchewan", "Nova Scotia", "New Brunswick", "Prince Edward Island",
+        "Newfoundland and Labrador", "Northwest Territories", "Yukon", "Nunavut",
+        # Abbreviations
+        "ON", "BC", "QC", "AB", "MB", "SK", "NS", "NB", "PE", "NL", "NT", "YT", "YK", "NU",
+    },
+    "AU": {
+        # Full names
+        "New South Wales", "Victoria", "Queensland", "Western Australia",
+        "South Australia", "Tasmania", "Australian Capital Territory",
+        "Northern Territory",
+        # Abbreviations
+        "NSW", "VIC", "QLD", "WA", "SA", "TAS", "ACT", "NT",
+    },
+    "US": {
+        "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado",
+        "Connecticut", "Delaware", "Florida", "Georgia", "Hawaii", "Idaho",
+        "Illinois", "Indiana", "Iowa", "Kansas", "Kentucky", "Louisiana",
+        "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota",
+        "Mississippi", "Missouri", "Montana", "Nebraska", "Nevada",
+        "New Hampshire", "New Jersey", "New Mexico", "New York",
+        "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon",
+        "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
+        "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+        "West Virginia", "Wisconsin", "Wyoming", "District of Columbia",
+        # Abbreviations
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI",
+        "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI",
+        "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC",
+        "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT",
+        "VT", "VA", "WA", "WV", "WI", "WY", "DC",
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Hard rejection rules (pure Python — no LLM, no network)
@@ -97,6 +168,56 @@ def _is_incomplete_address(listing: RawListing) -> Optional[str]:
     return None
 
 
+def _normalise_state(state: Optional[str], country: CountryCode) -> Optional[str]:
+    """
+    Expand a state/province abbreviation to its full name for the given country.
+
+    Returns the state unchanged if no mapping exists (including already-full names).
+    Returns None if state is null or empty.
+
+    Args:
+        state:   Raw state/province string from OutScraper.
+        country: Country code — selects the abbreviation mapping to use.
+
+    Returns:
+        Full-name state string, or None if state is absent.
+    """
+    if not state or not state.strip():
+        return state
+    mapping = _STATE_ABBREVIATIONS.get(country, {})
+    return mapping.get(state.strip(), state.strip())
+
+
+def _is_wrong_region(listing: RawListing, country: CountryCode) -> Optional[str]:
+    """
+    Return a rejection reason if the listing's state/province is not valid for
+    the target country.
+
+    Only rejects when the state field is non-null and does not match any known
+    province/state/territory for the country. Listings with a null state pass
+    through (they are caught later by _is_incomplete_address or manual review).
+
+    Args:
+        listing: The RawListing to evaluate.
+        country: The expected country code.
+
+    Returns:
+        Rejection reason string if the region is wrong, else None.
+    """
+    valid = _VALID_REGIONS.get(country)
+    if valid is None:
+        return None  # no allowlist defined for this country — skip check
+
+    state = (listing.state or "").strip()
+    if not state:
+        return None  # null/empty state — let other rules handle it
+
+    if state not in valid:
+        return f"wrong region: state/province '{state}' is not a valid {country} province/territory"
+
+    return None
+
+
 def _is_missing_contact(listing: RawListing) -> Optional[str]:
     """
     Return a rejection reason if BOTH phone AND website are missing.
@@ -116,7 +237,7 @@ def _is_missing_contact(listing: RawListing) -> Optional[str]:
     return None
 
 
-def _apply_hard_rules(listing: RawListing) -> Optional[str]:
+def _apply_hard_rules(listing: RawListing, country: CountryCode) -> Optional[str]:
     """
     Run all hard rejection rules against a single listing.
 
@@ -124,6 +245,7 @@ def _apply_hard_rules(listing: RawListing) -> Optional[str]:
 
     Args:
         listing: The RawListing to evaluate.
+        country: Country code — used for geographic region validation.
 
     Returns:
         The first rejection reason found, or None if the listing passes all rules.
@@ -132,6 +254,7 @@ def _apply_hard_rules(listing: RawListing) -> Optional[str]:
         _is_closed,
         _is_incomplete_address,
         _is_missing_contact,
+        lambda l: _is_wrong_region(l, country),
     ]:
         reason = check(listing)
         if reason:
@@ -398,7 +521,10 @@ async def run(
     passed: list[RawListing] = []
     rejected: list[CleanListing] = []
     for listing in deduped:
-        reason = _apply_hard_rules(listing)
+        normalised_state = _normalise_state(listing.state, country)
+        if normalised_state != listing.state:
+            listing = listing.model_copy(update={"state": normalised_state})
+        reason = _apply_hard_rules(listing, country)
         if reason:
             rejected.append(CleanListing(
                 **listing.model_dump(),

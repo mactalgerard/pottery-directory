@@ -1,0 +1,9 @@
+{
+  "batch_id": "msgbatch_01UamCK7no9YSJ8HZjjbQNKB",
+  "run_date": "2026-04-06",
+  "country": "AU",
+  "total_requests": 359,
+  "submitted_at": "2026-04-06T01:06:05.593251+00:00",
+  "listings_file": "data/enriched/AU/batch_listings_2026-04-06.json",
+  "label": ""
+}
